@@ -346,9 +346,9 @@ if run:
                             xls = to_excel_bytes(df_wide.reset_index(), sheet_name="main_wide")
                             st.download_button("엑셀 다운로드 (와이드)", data=xls, file_name=f"{cmp_cd}_main_wide.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                         with tabs[1]:
-    st.dataframe(df_long, use_container_width=True)
-    xls2 = to_excel_bytes(df_long, sheet_name="main_long")
-    st.download_button("엑셀 다운로드 (롱)", data=xls2, file_name=f"{cmp_cd}_main_long.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                            st.dataframe(df_long, use_container_width=True)
+                            xls2 = to_excel_bytes(df_long, sheet_name="main_long")
+                            st.download_button("엑셀 다운로드 (롱)", data=xls2, file_name=f"{cmp_cd}_main_long.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 # ▷ 차트: 지표 멀티선택 라인차트
 st.markdown("#### 📈 차트")
@@ -398,3 +398,4 @@ else:
 
 else:
     st.info("좌측 사이드바에서 종목코드와 섹션을 선택한 뒤 ‘수집/표시하기’를 눌러 주세요.")
+
