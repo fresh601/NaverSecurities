@@ -118,7 +118,7 @@ def fetch_main_table(cmp_cd: str, encparam: str, cmp_id: str):
         rows.append([metric] + values)
 
     df_wide = pd.DataFrame(rows, columns=["지표"] + years).set_index("지표")
-    df_long = df_wide.reset_index().melt(id_vars=["지표"], var_name="연도", value_name="값")
+    df_long = df_wide.reset_index().melt(id_vars=["지표"], var_name="기간", value_name="값")
     return df_wide, df_long
 
 # ──────────────────────────────────────────────
@@ -198,16 +198,27 @@ if data_key in st.session_state:
         try:
             if mode == "main" and encparam and cmp_id:
                 df_wide, df_long = fetch_main_table(cmp_cd, encparam, cmp_id)
-                tabs = st.tabs(["와이드","롱"])
+                tabs = st.tabs(["와이드","롱","차트"])
                 with tabs[0]:
                     st.dataframe(df_wide,use_container_width=True)
                     st.download_button("엑셀 다운로드 (와이드)", data=to_excel_bytes(df_wide.reset_index()), file_name=f"{cmp_cd}_main_wide.xlsx")
                 with tabs[1]:
                     st.dataframe(df_long,use_container_width=True)
                     st.download_button("엑셀 다운로드 (롱)", data=to_excel_bytes(df_long), file_name=f"{cmp_cd}_main_long.xlsx")
+                with tabs[2]:
                     st.markdown("#### 📈 차트")
-                    fig = px.line(df_long, x="연도", y="값", color="지표", markers=True)
-                    st.plotly_chart(fig,use_container_width=True)
+                    if not df_long.empty:
+                        # 컬럼 이름 확인 후 x,y 지정
+                        if "기간" in df_long.columns:
+                            x_col = "기간"
+                        elif "연도" in df_long.columns:
+                            x_col = "연도"
+                        else:
+                            x_col = df_long.columns[1]
+                        fig = px.line(df_long, x=x_col, y="값", color="지표", markers=True)
+                        st.plotly_chart(fig,use_container_width=True)
+                    else:
+                        st.info("차트로 표시할 데이터가 없습니다.")
             elif mode in ["fs","profit","value"] and encparam:
                 df = fetch_json_mode(cmp_cd,mode,encparam)
                 st.dataframe(df,use_container_width=True)
