@@ -1,15 +1,10 @@
+# streamlit_naver_finance_app.py
 # -*- coding: utf-8 -*-
 """
 네이버 증권 기업정보(와이즈리포트) 스트림릿 앱 — 완전본
 - cmp_cd(종목코드) 입력 → encparam/id 토큰 자동 획득(Selenium headless)
 - 주요재무정보(HTML 테이블), 재무제표/수익성/가치지표(JSON) 조회
 - 화면 표 + Plotly 차트 + 엑셀 다운로드(메모리 내 생성)
-
-필수 패키지(예):
-  pip install streamlit selenium beautifulsoup4 lxml html5lib pandas requests openpyxl plotly
-
-실행:
-  streamlit run streamlit_naver_finance_app.py
 """
 
 import os
@@ -22,13 +17,14 @@ import pandas as pd
 from bs4 import BeautifulSoup
 import streamlit as st
 import plotly.express as px
+from collections import defaultdict
 
-# Selenium (encparam/id 추출)
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 
+
 # ──────────────────────────────────────────────────────────────
-# 공통 유틸
+# 유틸 함수
 # ──────────────────────────────────────────────────────────────
 
 def to_number(s):
@@ -46,13 +42,10 @@ def to_number(s):
     except Exception:
         return None
 
-
 def _clean_text(x: str) -> str:
     return re.sub(r"\s+", " ", (x or "").replace("\xa0", " ").strip())
 
-
 def _extract_year_label(x: str) -> str:
-    """라벨에서 연/월을 정리. 연도만 있으면 그대로 반환."""
     if not isinstance(x, str):
         x = str(x)
     m = re.search(r"(20\d{2})(?:[./-]?(?:0?[1-9]|1[0-2]))?", x)
@@ -60,8 +53,9 @@ def _extract_year_label(x: str) -> str:
 
 
 # ──────────────────────────────────────────────────────────────
-# encparam / id 토큰 추출 (Selenium)
+# encparam / id 토큰 추출
 # ──────────────────────────────────────────────────────────────
+
 @st.cache_data(show_spinner=False)
 def get_encparam_and_id(cmp_cd: str, page_key: str) -> dict:
     chrome_options = Options()
@@ -70,10 +64,6 @@ def get_encparam_and_id(cmp_cd: str, page_key: str) -> dict:
     chrome_options.add_argument("--no-sandbox")
     chrome_options.add_argument("--disable-dev-shm-usage")
     chrome_options.add_argument("--window-size=1920,1080")
-
-    # Streamlit Cloud 등에서 chromium 경로가 있을 수 있음
-    # 자동 탐색이 실패하면 아래 주석 해제 후 경로 지정
-    # chrome_options.binary_location = "/usr/bin/chromium"  # 필요 시
 
     driver = webdriver.Chrome(options=chrome_options)
     try:
@@ -93,8 +83,10 @@ def get_encparam_and_id(cmp_cd: str, page_key: str) -> dict:
 
 
 # ──────────────────────────────────────────────────────────────
-# 주요재무정보(HTML) → df_wide, df_long
+# 주요재무정보 HTML → df_wide / df_long
+# 중복 연도 컬럼명 처리 포함
 # ──────────────────────────────────────────────────────────────
+
 @st.cache_data(show_spinner=False)
 def fetch_main_table(cmp_cd: str, encparam: str, cmp_id: str):
     url = "https://navercomp.wisereport.co.kr/v2/company/ajax/cF1001.aspx"
@@ -121,25 +113,23 @@ def fetch_main_table(cmp_cd: str, encparam: str, cmp_id: str):
 
     soup = BeautifulSoup(res.text, 'html.parser')
     tables = soup.select("table.gHead01.all-width")
-    target = None
-    for tb in tables:
-        txt = _clean_text(tb.get_text(" "))
-        if "연간" in txt or re.search(r"20\d\d", txt):
-            target = tb
-            break
+    target = next((tb for tb in tables if "연간" in _clean_text(tb.get_text(" ")) or re.search(r"20\d\d", tb.get_text(" "))), None)
     if not target:
         raise ValueError("연간 주요재무정보 테이블을 찾지 못했습니다.")
 
-    # 연도 헤더
+    # 헤더: 중복 컬럼 방지
     thead_rows = target.select("thead tr")
     year_cells = thead_rows[-1].find_all(["th", "td"]) if thead_rows else []
+    year_counter = defaultdict(int)
     years = []
     for th in year_cells:
         t = _clean_text(th.get_text(" "))
         if t and not re.search(r"주요재무정보|구분", t):
-            years.append(t)
+            year_counter[t] += 1
+            suffix = f"_{year_counter[t]}" if year_counter[t] > 1 else ""
+            years.append(t + suffix)
 
-    # 본문 파싱
+    # 본문
     rows = []
     for tr in target.select("tbody tr"):
         th = tr.find("th")
@@ -166,7 +156,7 @@ def fetch_main_table(cmp_cd: str, encparam: str, cmp_id: str):
 
 
 # ──────────────────────────────────────────────────────────────
-# JSON 표 파싱 (재무제표/수익성/가치)
+# JSON 파싱 (재무제표 / 수익성 / 가치지표)
 # ──────────────────────────────────────────────────────────────
 
 def parse_json_table(js: dict) -> pd.DataFrame:
@@ -175,17 +165,13 @@ def parse_json_table(js: dict) -> pd.DataFrame:
     unit = js.get("UNIT", "")
     if not data:
         raise ValueError("DATA가 없습니다.")
-
     labels = [re.sub(r"<br\s*/?>", " ", l).strip() for l in labels_raw]
     year_keys = sorted([k for k in data[0] if re.match(r"^DATA\d+$", k)], key=lambda x: int(x[4:]))
     if len(labels) < len(year_keys):
         labels += [f"DATA{i+1}" for i in range(len(labels), len(year_keys))]
-
     rows = [[r.get("ACC_NM", "")] + [r.get(k, "") for k in year_keys] for r in data]
     df = pd.DataFrame(rows, columns=["항목"] + labels[:len(year_keys)])
     df.insert(1, "단위", unit)
-
-    # 숫자화 + YoY
     num = df[labels[:len(year_keys)]].replace(",", "", regex=True).apply(pd.to_numeric, errors="coerce")
     if num.shape[1] >= 2:
         last, prev = num.iloc[:, -1], num.iloc[:, -2]
@@ -195,18 +181,11 @@ def parse_json_table(js: dict) -> pd.DataFrame:
         df["전년대비 (YoY, %)"] = pd.NA
     return df
 
-
 @st.cache_data(show_spinner=False)
 def fetch_json_mode(cmp_cd: str, mode: str, encparam: str) -> pd.DataFrame:
     url = "https://navercomp.wisereport.co.kr/v2/company/cF3002.aspx" if mode == "fs" else \
           "https://navercomp.wisereport.co.kr/v2/company/cF4002.aspx"
-
-    rpt_map = {
-        "fs": "1",      # 재무제표
-        "profit": "1",  # 수익성
-        "value": "5"     # 가치
-    }
-
+    rpt_map = {"fs": "1", "profit": "1", "value": "5"}
     cookies = {
         'setC1010001': '%5B%7B...%7D%5D',
         'setC1030001': '%5B%7B...%7D%5D',
@@ -227,7 +206,6 @@ def fetch_json_mode(cmp_cd: str, mode: str, encparam: str) -> pd.DataFrame:
         'cn': '',
         'encparam': encparam,
     }
-
     res = requests.get(url, params=params, headers=headers, cookies=cookies, timeout=20)
     res.raise_for_status()
     try:
@@ -238,14 +216,13 @@ def fetch_json_mode(cmp_cd: str, mode: str, encparam: str) -> pd.DataFrame:
 
 
 # ──────────────────────────────────────────────────────────────
-# 차트 변환 유틸
+# 시각화 / 엑셀 저장
 # ──────────────────────────────────────────────────────────────
 
 def melt_for_chart_from_main(df_long: pd.DataFrame) -> pd.DataFrame:
     out = df_long.copy()
     out["연도"] = out["연도"].map(_extract_year_label)
     return out
-
 
 def melt_for_chart_from_json(df_json: pd.DataFrame) -> pd.DataFrame:
     if df_json.empty:
@@ -257,11 +234,6 @@ def melt_for_chart_from_json(df_json: pd.DataFrame) -> pd.DataFrame:
     out["기간"] = out["기간"].map(_extract_year_label)
     out["값"] = pd.to_numeric(out["값"].astype(str).str.replace(",", "", regex=False), errors="coerce")
     return out
-
-
-# ──────────────────────────────────────────────────────────────
-# 엑셀 다운로드 헬퍼
-# ──────────────────────────────────────────────────────────────
 
 def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
     buf = io.BytesIO()
@@ -276,18 +248,16 @@ def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
 # ──────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="네이버 재무 크롤러", layout="wide")
-
 st.title("📊 네이버 증권 기업정보 뷰어")
 st.caption("cmp_cd를 입력하고 원하는 섹션을 선택하면, 표와 차트를 바로 확인하고 엑셀로 내려받을 수 있습니다.")
 
 with st.sidebar:
     st.header("설정")
-    cmp_cd = st.text_input("종목코드 (cmp_cd)", value="066570", help="예: 삼성전자 005930, LG전자 066570 등")
+    cmp_cd = st.text_input("종목코드 (cmp_cd)", value="005930")
     modes = st.multiselect(
         "불러올 섹션",
         options=["main", "fs", "profit", "value"],
         default=["main", "fs", "profit", "value"],
-        help="main=주요재무정보(HTML), fs=재무제표, profit=수익성, value=가치지표",
     )
     run = st.button("수집/표시하기", type="primary")
 
@@ -303,16 +273,13 @@ if run:
             token = get_encparam_and_id(cmp_cd, page_key)
         encparam, cmp_id = token.get("encparam"), token.get("id")
 
-        colA, colB, colC = st.columns([1,1,1])
-        with colA:
-            st.metric(label="종목코드", value=cmp_cd)
-        with colB:
-            st.metric(label="토큰(encparam)", value=(encparam[:10] + "…") if encparam else "없음")
-        with colC:
-            st.metric(label="ID", value=cmp_id or "없음")
+        colA, colB, colC = st.columns([1, 1, 1])
+        colA.metric("종목코드", cmp_cd)
+        colB.metric("encparam", (encparam[:10] + "…") if encparam else "없음")
+        colC.metric("ID", cmp_id or "없음")
 
         if not encparam or not cmp_id:
-            st.warning("토큰을 찾지 못했습니다. 잠시 후 다시 시도하거나 섹션을 바꿔 시도해 보세요.")
+            st.warning("토큰 추출 실패. 섹션을 바꾸거나 잠시 후 재시도하세요.")
 
         for mode in modes:
             st.markdown("---")
@@ -320,86 +287,38 @@ if run:
 
             if mode == "main":
                 if encparam and cmp_id:
-                    try:
-                        with st.spinner("주요재무정보(HTML) 불러오는 중…"):
-                            df_wide, df_long = fetch_main_table(cmp_cd, encparam, cmp_id)
-                        tabs = st.tabs(["와이드", "롱(연도별)"])
-                        with tabs[0]:
-                            st.dataframe(df_wide, use_container_width=True)
-                            xls = to_excel_bytes(df_wide.reset_index(), sheet_name="main_wide")
-                            st.download_button(
-                                "엑셀 다운로드 (와이드)", data=xls,
-                                file_name=f"{cmp_cd}_main_wide.xlsx",
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            )
-                        with tabs[1]:
-                            st.dataframe(df_long, use_container_width=True)
-                            xls2 = to_excel_bytes(df_long, sheet_name="main_long")
-                            st.download_button(
-                                "엑셀 다운로드 (롱)", data=xls2,
-                                file_name=f"{cmp_cd}_main_long.xlsx",
-                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            )
-                            st.markdown("#### 📈 차트")
-                            chart_df = melt_for_chart_from_main(df_long)
-                            avail_metrics = sorted(chart_df["지표"].unique().tolist())
-                            sel_metrics = st.multiselect(
-                                "지표 선택",
-                                options=avail_metrics,
-                                default=avail_metrics[:3],
-                                key=f"main_metrics_{cmp_cd}",
-                            )
-                            if sel_metrics:
-                                plot_df = chart_df[chart_df["지표"].isin(sel_metrics)].copy()
-                                fig = px.line(plot_df, x="연도", y="값", color="지표", markers=True)
-                                st.plotly_chart(fig, use_container_width=True)
-                            else:
-                                st.info("차트에 표시할 지표를 선택하세요.")
-                    except Exception as e:
-                        with st.expander("오류 상세 보기"):
-                            st.exception(e)
-                        st.stop()
+                    df_wide, df_long = fetch_main_table(cmp_cd, encparam, cmp_id)
+                    tabs = st.tabs(["와이드", "롱(연도별)"])
+                    with tabs[0]:
+                        st.dataframe(df_wide, use_container_width=True)
+                        xls = to_excel_bytes(df_wide.reset_index(), sheet_name="main_wide")
+                        st.download_button("엑셀 다운로드 (와이드)", data=xls, file_name=f"{cmp_cd}_main_wide.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    with tabs[1]:
+                        st.dataframe(df_long, use_container_width=True)
+                        xls2 = to_excel_bytes(df_long, sheet_name="main_long")
+                        st.download_button("엑셀 다운로드 (롱)", data=xls2, file_name=f"{cmp_cd}_main_long.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                        chart_df = melt_for_chart_from_main(df_long)
+                        sel_metrics = st.multiselect("차트 지표 선택", options=sorted(chart_df["지표"].unique()), default=sorted(chart_df["지표"].unique())[:3], key=f"main_metrics_{cmp_cd}")
+                        if sel_metrics:
+                            plot_df = chart_df[chart_df["지표"].isin(sel_metrics)]
+                            fig = px.line(plot_df, x="연도", y="값", color="지표", markers=True)
+                            st.plotly_chart(fig, use_container_width=True)
                 else:
-                    st.info("토큰이 없어 main 섹션을 건너뜁니다.")
+                    st.info("토큰 없음. main 섹션 생략.")
             else:
                 if encparam:
-                    try:
-                        with st.spinner(f"{mode} 데이터(JSON) 불러오는 중…"):
-                            df = fetch_json_mode(cmp_cd, mode, encparam)
-                        st.dataframe(df, use_container_width=True)
-                        xls = to_excel_bytes(df, sheet_name=mode)
-                        st.download_button(
-                            "엑셀 다운로드", data=xls,
-                            file_name=f"{cmp_cd}_{mode}.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        )
-
-                        st.markdown("#### 📈 차트")
-                        json_long = melt_for_chart_from_json(df)
-                        if not json_long.empty:
-                            choices = sorted(json_long["항목"].dropna().unique().tolist())
-                            sel_items = st.multiselect(
-                                "항목 선택", options=choices, default=choices[:3], key=f"{mode}_items_{cmp_cd}"
-                            )
-                            chart_type = st.radio(
-                                "차트 종류", options=["line", "bar"], horizontal=True, key=f"{mode}_charttype_{cmp_cd}",
-                            )
-                            filtered = json_long[json_long["항목"].isin(sel_items)] if sel_items else json_long.head(0)
-                            if not filtered.empty:
-                                if chart_type == "line":
-                                    fig = px.line(filtered, x="기간", y="값", color="항목", markers=True)
-                                else:
-                                    fig = px.bar(filtered, x="기간", y="값", color="항목", barmode="group")
-                                st.plotly_chart(fig, use_container_width=True)
-                            else:
-                                st.info("차트에 표시할 항목을 선택하세요.")
-                        else:
-                            st.info("차트로 변환할 데이터가 없습니다.")
-                    except Exception as e:
-                        with st.expander("오류 상세 보기"):
-                            st.exception(e)
-                        st.stop()
+                    df = fetch_json_mode(cmp_cd, mode, encparam)
+                    st.dataframe(df, use_container_width=True)
+                    xls = to_excel_bytes(df, sheet_name=mode)
+                    st.download_button("엑셀 다운로드", data=xls, file_name=f"{cmp_cd}_{mode}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                    json_long = melt_for_chart_from_json(df)
+                    sel_items = st.multiselect("항목 선택", options=sorted(json_long["항목"].unique()), default=sorted(json_long["항목"].unique())[:3], key=f"{mode}_items_{cmp_cd}")
+                    chart_type = st.radio("차트 종류", options=["line", "bar"], horizontal=True, key=f"{mode}_charttype_{cmp_cd}")
+                    filtered = json_long[json_long["항목"].isin(sel_items)]
+                    if not filtered.empty:
+                        fig = px.line(filtered, x="기간", y="값", color="항목", markers=True) if chart_type == "line" else px.bar(filtered, x="기간", y="값", color="항목", barmode="group")
+                        st.plotly_chart(fig, use_container_width=True)
                 else:
-                    st.info("encparam이 없어 JSON 섹션을 건너뜁니다.")
+                    st.info(f"encparam 없음. {mode} 섹션 생략.")
 else:
-    st.info("좌측 사이드바에서 종목코드와 섹션을 선택한 뒤 ‘수집/표시하기’를 눌러 주세요.")
+    st.info("좌측에서 종목코드와 섹션 선택 후 ‘수집/표시하기’를 눌러주세요.")
