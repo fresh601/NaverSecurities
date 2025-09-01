@@ -6,3 +6,4 @@ html5lib
 pandas
 requests
 openpyxl
+plotly
