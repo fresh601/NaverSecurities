@@ -21,6 +21,7 @@ import requests
 import pandas as pd
 from bs4 import BeautifulSoup
 import streamlit as st
+import plotly.express as px
 
 # ──────────────────────────────────────────────────────────────
 # Selenium(옵션) - encparam/id 토큰 추출용
@@ -234,8 +235,43 @@ def fetch_json_mode(cmp_cd: str, mode: str, encparam: str) -> pd.DataFrame:
 
 
 # ──────────────────────────────────────────────────────────────
+# 차트 유틸 (공통)
+# ──────────────────────────────────────────────────────────────
+
+def _extract_year_label(x: str) -> str:
+    """라벨에서 연도/기간만 깔끔히 추출 (예: '2023/12' -> '2023', '2023.12' -> '2023.12').
+    라벨이 단일 연도라면 그 값을 그대로 반환."""
+    if not isinstance(x, str):
+        x = str(x)
+    m = re.search(r"(20\d{2})(?:[./-]?(?:0?[1-9]|1[0-2]))?", x)
+    return m.group(1) if m else x
+
+
+def _melt_for_chart_from_main(df_long: pd.DataFrame) -> pd.DataFrame:
+    """main 섹션용 df_long(지표, 연도, 값)에서 차트 입력형으로 정리."""
+    out = df_long.copy()
+    out["연도"] = out["연도"].map(_extract_year_label)
+    return out
+
+
+def _melt_for_chart_from_json(df_json: pd.DataFrame) -> pd.DataFrame:
+    """JSON 섹션용 표를 (항목, 단위, 기간1..N)에서 (항목, 기간, 값) 롱포맷으로 변환."""
+    if df_json.empty:
+        return df_json
+    cols = list(df_json.columns)
+    value_cols = [c for c in cols if c not in ("항목", "단위", "전년대비 (YoY, %)")]
+    out = df_json.melt(id_vars=[c for c in ["항목", "단위"] if c in df_json.columns],
+                       value_vars=value_cols, var_name="기간", value_name="값")
+    out["기간"] = out["기간"].map(_extract_year_label)
+    # 숫자 변환
+    out["값"] = pd.to_numeric(out["값"].astype(str).str.replace(",", "", regex=False), errors="coerce")
+    return out
+
+
+# ──────────────────────────────────────────────────────────────
 # 엑셀 다운로드 헬퍼
 # ──────────────────────────────────────────────────────────────
+
 
 def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
     buf = io.BytesIO()
@@ -310,9 +346,21 @@ if run:
                             xls = to_excel_bytes(df_wide.reset_index(), sheet_name="main_wide")
                             st.download_button("엑셀 다운로드 (와이드)", data=xls, file_name=f"{cmp_cd}_main_wide.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
                         with tabs[1]:
-                            st.dataframe(df_long, use_container_width=True)
-                            xls2 = to_excel_bytes(df_long, sheet_name="main_long")
-                            st.download_button("엑셀 다운로드 (롱)", data=xls2, file_name=f"{cmp_cd}_main_long.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    st.dataframe(df_long, use_container_width=True)
+    xls2 = to_excel_bytes(df_long, sheet_name="main_long")
+    st.download_button("엑셀 다운로드 (롱)", data=xls2, file_name=f"{cmp_cd}_main_long.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# ▷ 차트: 지표 멀티선택 라인차트
+st.markdown("#### 📈 차트")
+chart_df = _melt_for_chart_from_main(df_long)
+avail_metrics = sorted(chart_df["지표"].unique().tolist())
+sel_metrics = st.multiselect("지표 선택", options=avail_metrics, default=avail_metrics[:3], key=f"main_metrics_{cmp_cd}")
+if sel_metrics:
+    plot_df = chart_df[chart_df["지표"].isin(sel_metrics)].copy()
+    fig = px.line(plot_df, x="연도", y="값", color="지표", markers=True)
+    st.plotly_chart(fig, use_container_width=True)
+else:
+    st.info("차트에 표시할 지표를 선택하세요.")
                     else:
                         st.info("토큰이 없어 main 섹션을 건너뜁니다.")
                 else:
@@ -320,8 +368,27 @@ if run:
                         with st.spinner(f"{mode} 데이터(JSON) 불러오는 중…"):
                             df = fetch_json_mode(cmp_cd, mode, encparam)
                         st.dataframe(df, use_container_width=True)
-                        xls = to_excel_bytes(df, sheet_name=mode)
-                        st.download_button("엑셀 다운로드", data=xls, file_name=f"{cmp_cd}_{mode}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+xls = to_excel_bytes(df, sheet_name=mode)
+st.download_button("엑셀 다운로드", data=xls, file_name=f"{cmp_cd}_{mode}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# ▷ 차트: 항목 멀티선택 라인/막대 토글
+st.markdown("#### 📈 차트")
+json_long = _melt_for_chart_from_json(df)
+if not json_long.empty:
+    choices = sorted(json_long["항목"].dropna().unique().tolist())
+    sel_items = st.multiselect("항목 선택", options=choices, default=choices[:3], key=f"{mode}_items_{cmp_cd}")
+    chart_type = st.radio("차트 종류", options=["line", "bar"], horizontal=True, key=f"{mode}_charttype_{cmp_cd}")
+    filtered = json_long[json_long["항목"].isin(sel_items)] if sel_items else json_long.head(0)
+    if not filtered.empty:
+        if chart_type == "line":
+            fig = px.line(filtered, x="기간", y="값", color="항목", markers=True)
+        else:
+            fig = px.bar(filtered, x="기간", y="값", color="항목", barmode="group")
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("차트에 표시할 항목을 선택하세요.")
+else:
+    st.info("차트로 변환할 데이터가 없습니다.")
                     else:
                         st.info("encparam이 없어 JSON 섹션을 건너뜁니다.")
             except Exception as e:
